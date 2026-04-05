@@ -51,6 +51,11 @@ TEXT_PRIMARY = "#ffffff"
 TEXT_DIM     = "#8e8e93"
 SEL_COLOR    = "#00c8ff"
 
+# Button-specific palette (bg, fg, hover-bg, disabled-fg)
+_BTN_DELETE = ("#b91c1c", "#ffe4e1", "#991b1b", "#e07070")  # deep red / rose text
+_BTN_UNDO   = ("#3a3a3c", "#ebebf5", "#48484a", "#6e6e73")  # elevated card / soft white
+_BTN_SAVE   = ("#1a7a3c", "#d1fae5", "#166534", "#5ca87a")  # deep green / mint text
+
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -173,13 +178,13 @@ class ObjectRemoverApp:
         topbar.pack(fill=tk.X)
         topbar.pack_propagate(False)
 
-        _btn_topbar = lambda text, cmd, bg: tk.Button(
+        _btn_topbar = lambda text, cmd, bg, hover: tk.Button(
             topbar, text=text, command=cmd,
-            bg=bg, fg=TEXT_PRIMARY, font=("Helvetica", 12, "bold"),
+            bg=bg, fg="#e8f0ff", font=("Helvetica", 12, "bold"),
             relief=tk.FLAT, padx=16, pady=6, cursor="hand2",
-            activebackground=bg, activeforeground=TEXT_PRIMARY, bd=0,
+            activebackground=hover, activeforeground="#e8f0ff", bd=0,
         )
-        _btn_topbar("  Add Image", self._open_dialog, ACCENT_BLUE).pack(
+        _btn_topbar("  Add Image", self._open_dialog, "#0060cc", "#004fa8").pack(
             side=tk.LEFT, padx=12, pady=10)
 
         self.status_var = tk.StringVar(value="Drag an image here or click  Add Image  to start")
@@ -239,20 +244,23 @@ class ObjectRemoverApp:
 
         tk.Frame(panel, bg=BG_CARD, height=1).pack(fill=tk.X, padx=10, pady=8)
 
-        def _action_btn(text, cmd, bg, disabled_fg):
+        def _action_btn(text, cmd, palette):
+            bg, fg, hover_bg, _ = palette
             b = tk.Button(
                 panel, text=text, command=cmd,
-                bg=bg, fg=TEXT_PRIMARY, font=("Helvetica", 12, "bold"),
+                bg=BG_CARD, fg="#5a5a5e", font=("Helvetica", 12, "bold"),
                 relief=tk.FLAT, padx=12, pady=11, cursor="hand2",
-                activebackground=bg, activeforeground=TEXT_PRIMARY,
-                disabledforeground=disabled_fg, bd=0, state=tk.DISABLED,
+                activebackground=hover_bg, activeforeground=fg,
+                disabledforeground="#5a5a5e", bd=0, state=tk.DISABLED,
             )
             b.pack(fill=tk.X, padx=10, pady=3)
+            b._active_bg = bg
+            b._active_fg = fg
             return b
 
-        self.delete_btn = _action_btn("🗑   Delete Object", self._delete_object, ACCENT_RED,   "#ff9999")
-        self.undo_btn   = _action_btn("↩   Undo",           self._undo,           BG_CARD,      "#666666")
-        self.save_btn   = _action_btn("💾   Save Image",     self._save_image,     ACCENT_GREEN, "#99ddbb")
+        self.delete_btn = _action_btn("🗑   Delete Object", self._delete_object, _BTN_DELETE)
+        self.undo_btn   = _action_btn("↩   Undo",           self._undo,           _BTN_UNDO)
+        self.save_btn   = _action_btn("💾   Save Image",     self._save_image,     _BTN_SAVE)
 
         # Progress bar
         style = ttk.Style()
@@ -662,7 +670,19 @@ class ObjectRemoverApp:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _set_btn(self, btn: tk.Button, enabled: bool):
-        btn.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+        if enabled:
+            btn.configure(
+                state=tk.NORMAL,
+                bg=btn._active_bg,
+                fg=btn._active_fg,
+                disabledforeground="#5a5a5e",
+            )
+        else:
+            btn.configure(
+                state=tk.DISABLED,
+                bg=BG_CARD,
+                fg="#5a5a5e",
+            )
 
     def _set_status(self, msg: str):
         self.root.after(0, lambda: self.status_var.set(msg))
