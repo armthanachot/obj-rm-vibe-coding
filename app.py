@@ -23,6 +23,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import tkinter.ttk as ttk
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 SAM_CHECKPOINT_URL  = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
@@ -48,12 +54,17 @@ SEL_COLOR    = "#00c8ff"
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
-def _cuda_available() -> bool:
+def _best_device() -> str:
+    """Return the best available compute device: cuda > mps (Apple Silicon) > cpu."""
     try:
         import torch
-        return torch.cuda.is_available()
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
     except ImportError:
-        return False
+        pass
+    return "cpu"
 
 
 def _download_file(url: str, dest: str) -> None:
@@ -110,7 +121,10 @@ def _infer_save_params(img: Image.Image) -> dict:
 class ObjectRemoverApp:
 
     def __init__(self, image_path: str | None = None):
-        self.root = tk.Tk()
+        if _DND_AVAILABLE:
+            self.root = TkinterDnD.Tk()
+        else:
+            self.root = tk.Tk()
         self.root.title("AI Object Remover")
         self.root.configure(bg=BG_ROOT)
         self.root.geometry("1440x880")
@@ -165,10 +179,10 @@ class ObjectRemoverApp:
             relief=tk.FLAT, padx=16, pady=6, cursor="hand2",
             activebackground=bg, activeforeground=TEXT_PRIMARY, bd=0,
         )
-        _btn_topbar("  Open Image", self._open_dialog, ACCENT_BLUE).pack(
+        _btn_topbar("  Add Image", self._open_dialog, ACCENT_BLUE).pack(
             side=tk.LEFT, padx=12, pady=10)
 
-        self.status_var = tk.StringVar(value="Open an image to start")
+        self.status_var = tk.StringVar(value="Drag an image here or click  Add Image  to start")
         tk.Label(topbar, textvariable=self.status_var,
                  bg=BG_PANEL, fg=TEXT_DIM, font=("Helvetica", 11)
                  ).pack(side=tk.LEFT, padx=16)
@@ -193,6 +207,15 @@ class ObjectRemoverApp:
         self.canvas.bind("<B1-Motion>",       self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
+        if _DND_AVAILABLE:
+            # Register on root for maximum macOS compatibility (canvas alone is unreliable)
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>",      self._on_file_drop)
+            # Canvas-level visual feedback only
+            self.canvas.drop_target_register(DND_FILES)
+            self.canvas.dnd_bind("<<DragEnter>>", self._on_drag_enter_canvas)
+            self.canvas.dnd_bind("<<DragLeave>>", self._on_drag_leave_canvas)
+
         # ── Right panel
         panel = tk.Frame(body, bg=BG_PANEL, width=220)
         panel.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10)
@@ -204,7 +227,7 @@ class ObjectRemoverApp:
         tk.Label(card, text="How to use", bg=BG_CARD, fg=TEXT_PRIMARY,
                  font=("Helvetica", 11, "bold")).pack(anchor=tk.W)
         for step in (
-            "① Open an image",
+            "① Drag image here  or  Add Image",
             "② Drag to select an object",
             "③ AI highlights the object",
             "④ Click  Delete Object",
@@ -216,20 +239,20 @@ class ObjectRemoverApp:
 
         tk.Frame(panel, bg=BG_CARD, height=1).pack(fill=tk.X, padx=10, pady=8)
 
-        def _action_btn(text, cmd, bg):
+        def _action_btn(text, cmd, bg, disabled_fg):
             b = tk.Button(
                 panel, text=text, command=cmd,
                 bg=bg, fg=TEXT_PRIMARY, font=("Helvetica", 12, "bold"),
                 relief=tk.FLAT, padx=12, pady=11, cursor="hand2",
                 activebackground=bg, activeforeground=TEXT_PRIMARY,
-                disabledforeground="#555555", bd=0, state=tk.DISABLED,
+                disabledforeground=disabled_fg, bd=0, state=tk.DISABLED,
             )
             b.pack(fill=tk.X, padx=10, pady=3)
             return b
 
-        self.delete_btn = _action_btn("🗑   Delete Object", self._delete_object, ACCENT_RED)
-        self.undo_btn   = _action_btn("↩   Undo",           self._undo,           BG_CARD)
-        self.save_btn   = _action_btn("💾   Save Image",     self._save_image,     ACCENT_GREEN)
+        self.delete_btn = _action_btn("🗑   Delete Object", self._delete_object, ACCENT_RED,   "#ff9999")
+        self.undo_btn   = _action_btn("↩   Undo",           self._undo,           BG_CARD,      "#666666")
+        self.save_btn   = _action_btn("💾   Save Image",     self._save_image,     ACCENT_GREEN, "#99ddbb")
 
         # Progress bar
         style = ttk.Style()
@@ -243,15 +266,29 @@ class ObjectRemoverApp:
         # Placeholder text on canvas
         self.canvas.after(100, self._draw_placeholder)
 
-    def _draw_placeholder(self):
+    def _draw_placeholder(self, highlight: bool = False):
         if self.work_image is None:
             cw = self.canvas.winfo_width()
             ch = self.canvas.winfo_height()
             self.canvas.delete("placeholder")
+            pad = 40
+            border_color  = ACCENT_BLUE if highlight else "#333333"
+            text_color    = ACCENT_BLUE if highlight else "#555555"
+            subtext_color = ACCENT_BLUE if highlight else "#3a3a3a"
+            drop_label    = "⬇  Drop to open" if highlight else "⬇  Drag an image here"
+            self.canvas.create_rectangle(
+                pad, pad, cw - pad, ch - pad,
+                outline=border_color, dash=(10, 6), width=2, tags="placeholder",
+            )
             self.canvas.create_text(
-                cw // 2, ch // 2,
-                text="Open an image to start",
-                fill="#333333", font=("Helvetica", 18), tags="placeholder",
+                cw // 2, ch // 2 - 18,
+                text=drop_label,
+                fill=text_color, font=("Helvetica", 20, "bold"), tags="placeholder",
+            )
+            self.canvas.create_text(
+                cw // 2, ch // 2 + 16,
+                text="or click  Add Image  in the toolbar above",
+                fill=subtext_color, font=("Helvetica", 12), tags="placeholder",
             )
 
     # ── Model loading ──────────────────────────────────────────────────────────
@@ -259,13 +296,14 @@ class ObjectRemoverApp:
     def _load_models_async(self):
         def _worker():
             try:
-                self._set_status_ai("⏳  Downloading / loading SAM…")
+                device = _best_device()
+                self._set_status_ai(f"⏳  Loading SAM  [{device}]…")
                 self._load_sam()
-                self._set_status_ai("⏳  Loading LaMa inpainter…")
+                self._set_status_ai(f"⏳  Loading LaMa  [{device}]…")
                 self._load_lama()
                 self.models_ready = True
-                self._set_status_ai("✅  AI ready")
-                self._set_status("Open an image or drag to select an object")
+                self._set_status_ai(f"✅  AI ready  [{device}]")
+                self._set_status("Drag an image here or click  Add Image  to start")
             except Exception:
                 err = traceback.format_exc()
                 print(err)
@@ -284,7 +322,7 @@ class ObjectRemoverApp:
             self._set_status("Downloading SAM model (375 MB) — first run only, please wait…")
             _download_file(SAM_CHECKPOINT_URL, ckpt)
 
-        device = "cuda" if _cuda_available() else "cpu"
+        device = _best_device()
         sam = sam_model_registry["vit_b"](checkpoint=ckpt)
         sam.to(device=device)
         self.predictor = SamPredictor(sam)
@@ -302,7 +340,8 @@ class ObjectRemoverApp:
             self._set_status("Downloading LaMa model (200 MB) — first run only, please wait…")
             _download_file(lama_url, lama_ckpt)
 
-        self.lama = SimpleLama()
+        import torch
+        self.lama = SimpleLama(device=torch.device(_best_device()))
 
     # ── Image loading ──────────────────────────────────────────────────────────
 
@@ -316,6 +355,41 @@ class ObjectRemoverApp:
         )
         if path:
             self.load_image(path)
+
+    # ── Drag-and-drop handlers ─────────────────────────────────────────────────
+
+    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+
+    def _on_file_drop(self, event):
+        """Handle a file dropped onto the canvas."""
+        self._on_drag_leave_canvas(event)
+        try:
+            paths = self.root.tk.splitlist(event.data)
+        except Exception:
+            paths = [event.data.strip("{}")]
+        if not paths:
+            return
+        path = paths[0]
+        ext  = os.path.splitext(path)[1].lower()
+        if ext not in self._IMAGE_EXTS:
+            messagebox.showwarning(
+                "Unsupported File",
+                f"Please drop an image file.\n"
+                f"Supported formats: JPG, PNG, BMP, TIFF, WebP\n\n"
+                f"Got: {os.path.basename(path)}",
+            )
+            return
+        self.load_image(path)
+
+    def _on_drag_enter_canvas(self, event):
+        """Visual highlight when a file is dragged over the canvas."""
+        if self.work_image is None:
+            self._draw_placeholder(highlight=True)
+
+    def _on_drag_leave_canvas(self, event):
+        """Revert visual highlight when drag leaves the canvas."""
+        if self.work_image is None:
+            self._draw_placeholder(highlight=False)
 
     def load_image(self, path: str):
         try:
