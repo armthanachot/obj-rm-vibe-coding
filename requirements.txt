@@ -1,0 +1,16 @@
+# Core ML / vision
+torch>=2.0.0
+torchvision>=0.15.0
+
+# SAM – Segment Anything Model (Meta AI)
+# Install separately with the command below:
+#   pip install git+https://github.com/facebookresearch/segment-anything.git
+segment-anything
+
+# LaMa inpainting model (auto-downloads weights on first run)
+simple-lama-inpainting>=0.1.0
+
+# Image processing
+Pillow>=10.0.0
+numpy>=1.24.0
+opencv-python>=4.8.0
