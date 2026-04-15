@@ -16,6 +16,8 @@ import os
 import sys
 import threading
 import traceback
+import io
+import base64
 
 import cv2
 import numpy as np
@@ -57,6 +59,7 @@ _BTN_REMOVE_BG = ("#0891b2", "#ecfeff", "#0e7490", "#67e8f9", "#0c2a32")
 _BTN_KEEP      = ("#d97706", "#fffbeb", "#b45309", "#fcd34d", "#3a2607")
 _BTN_DELETE    = ("#e11d48", "#fff1f2", "#be123c", "#fb7185", "#3f1519")
 _BTN_UNDO      = ("#8b5cf6", "#f5f3ff", "#7c3aed", "#c4b5fd", "#2a1f3d")
+_BTN_COPY      = ("#0ea5e9", "#e0f2fe", "#0284c7", "#7dd3fc", "#132734")
 _BTN_SAVE      = ("#10b981", "#ecfdf5", "#059669", "#6ee7b7", "#0f2a22")
 
 _KEEP_L_IDLE    = "📐   Keep region"
@@ -316,16 +319,19 @@ class ObjectRemoverApp:
             bg, fg, hover_bg, dis_fg, dis_bg = palette
             b = tk.Button(
                 panel, text=text, command=cmd,
-                bg=dis_bg, fg=dis_fg, font=("Helvetica", 12, "bold"),
+                bg=BG_CARD, fg=dis_fg, font=("Helvetica", 12, "bold"),
                 relief=tk.FLAT, padx=12, pady=11, cursor="hand2",
-                activebackground=hover_bg, activeforeground=fg,
-                disabledforeground=dis_fg, bd=0, state=tk.DISABLED,
+                activebackground=BG_CARD, activeforeground=fg,
+                disabledforeground=dis_fg, bd=1, state=tk.DISABLED,
+                highlightthickness=2, highlightbackground=BG_CARD, highlightcolor=BG_CARD,
             )
             b.pack(fill=tk.X, padx=10, pady=3)
             b._active_bg = bg
             b._active_fg = fg
-            b._disabled_bg = dis_bg
+            b._disabled_bg = BG_CARD
             b._disabled_fg = dis_fg
+            b._active_border = bg
+            b._disabled_border = BG_CARD
             return b
 
         self.remove_bg_btn = _action_btn(
@@ -334,6 +340,7 @@ class ObjectRemoverApp:
         self.keep_btn = _action_btn(_KEEP_L_IDLE, self._on_keep_click, _BTN_KEEP)
         self.delete_btn = _action_btn("🗑   Delete Object", self._delete_object, _BTN_DELETE)
         self.undo_btn   = _action_btn("↩   Undo",           self._undo,           _BTN_UNDO)
+        self.copy_btn   = _action_btn("📋   Copy Image",     self._copy_work_image_as_base64, _BTN_COPY)
         self.save_btn   = _action_btn("💾   Save Image",     self._save_image,     _BTN_SAVE)
 
         # Progress bar
@@ -515,6 +522,7 @@ class ObjectRemoverApp:
             self._set_btn(self.keep_btn, True)
             self._set_btn(self.delete_btn, False)
             self._set_btn(self.undo_btn, False)
+            self._set_btn(self.copy_btn, False)
             self._set_btn(self.save_btn, False)
 
             self._render()
@@ -910,6 +918,7 @@ class ObjectRemoverApp:
         self._set_btn(self.keep_btn, True)
         self._set_btn(self.remove_bg_btn, True)
         self._set_btn(self.undo_btn, True)
+        self._set_btn(self.copy_btn, True)
         self._set_btn(self.save_btn, True)
         self._set_status(
             f"Tight crop {gx1 - gx0} × {gy1 - gy0}px — opaque patch; layer over transparent bg."
@@ -965,6 +974,7 @@ class ObjectRemoverApp:
         self._set_btn(self.keep_btn, True)
         self._set_btn(self.delete_btn, False)
         self._set_btn(self.undo_btn, True)
+        self._set_btn(self.copy_btn, True)
         self._set_btn(self.save_btn, True)
         m = self._rembg_model_name or "rembg"
         self._set_status(f"Background removed ({m}) — transparent PNG. Save as PNG to keep alpha.")
@@ -1028,6 +1038,7 @@ class ObjectRemoverApp:
         self._set_btn(self.remove_bg_btn, True)
         self._set_btn(self.keep_btn, True)
         self._set_btn(self.undo_btn,   True)
+        self._set_btn(self.copy_btn,   True)
         self._set_btn(self.save_btn,   True)
         self._set_status("Object removed!  Drag to select another, or save the result.")
 
@@ -1056,6 +1067,7 @@ class ObjectRemoverApp:
         self._set_btn(self.remove_bg_btn, True)
         self._set_btn(self.keep_btn, True)
         self._set_btn(self.undo_btn, bool(self.history))
+        self._set_btn(self.copy_btn, True)
         self._set_btn(self.save_btn, True)
         self._set_status("Undone.")
 
@@ -1097,21 +1109,48 @@ class ObjectRemoverApp:
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
 
+    def _copy_work_image_as_base64(self):
+        if self.work_image is None:
+            return
+        try:
+            # Use PNG for stable lossless clipboard export (works for RGB/RGBA).
+            buf = io.BytesIO()
+            self.work_image.save(buf, format="PNG", compress_level=1)
+            b64_text = base64.b64encode(buf.getvalue()).decode("ascii")
+            self.root.clipboard_clear()
+            self.root.clipboard_append(b64_text)
+            self.root.update_idletasks()
+            self._set_status(
+                f"✅ Image copied (Base64 PNG) — {self.work_image.width} × {self.work_image.height}"
+            )
+        except Exception as e:
+            messagebox.showerror("Clipboard Error", f"Could not copy Base64:\n{e}")
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _set_btn(self, btn: tk.Button, enabled: bool):
         if enabled:
             btn.configure(
                 state=tk.NORMAL,
-                bg=btn._active_bg,
+                bg=BG_CARD,
                 fg=btn._active_fg,
+                activebackground=BG_CARD,
                 disabledforeground=getattr(btn, "_disabled_fg", "#8e8e93"),
+                highlightthickness=1,
+                highlightbackground=getattr(btn, "_active_border", ACCENT_BLUE),
+                highlightcolor=getattr(btn, "_active_border", ACCENT_BLUE),
+                bd=0,
             )
         else:
             btn.configure(
                 state=tk.DISABLED,
-                bg=getattr(btn, "_disabled_bg", BG_CARD),
+                bg=BG_CARD,
                 fg=getattr(btn, "_disabled_fg", "#5a5a5e"),
+                activebackground=BG_CARD,
+                highlightthickness=1,
+                highlightbackground=getattr(btn, "_disabled_border", BG_CARD),
+                highlightcolor=getattr(btn, "_disabled_border", BG_CARD),
+                bd=0,
             )
 
     def _set_status(self, msg: str):
