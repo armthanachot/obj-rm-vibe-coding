@@ -14,3 +14,10 @@ simple-lama-inpainting>=0.1.0
 Pillow>=10.0.0
 numpy>=1.24.0
 opencv-python>=4.8.0
+
+# GUI drag-and-drop (file paths onto the window)
+tkinterdnd2>=0.4.0
+
+# Background removal (BiRefNet / ISNet / U²-Net via rembg; downloads on first use)
+rembg>=2.0.60
+onnxruntime>=1.16.0

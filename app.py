@@ -3,8 +3,9 @@
 AI Object Remover
 -----------------
 Removes objects from images using:
-  • SAM (Segment Anything Model) – precise object boundary detection
+  • SAM (Segment Anything Model) – box-guided object selection for delete / inpaint
   • LaMa – deep learning inpainting for seamless background fill
+  • rembg (BiRefNet / ISNet / U²-Net) – remove background + Keep-region tight crop
 
 Usage:
     python app.py [image_path]
@@ -18,7 +19,7 @@ import traceback
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import tkinter.ttk as ttk
@@ -51,10 +52,24 @@ TEXT_PRIMARY = "#ffffff"
 TEXT_DIM     = "#8e8e93"
 SEL_COLOR    = "#00c8ff"
 
-# Button-specific palette (bg, fg, hover-bg, disabled-fg)
-_BTN_DELETE = ("#b91c1c", "#ffe4e1", "#991b1b", "#e07070")  # deep red / rose text
-_BTN_UNDO   = ("#3a3a3c", "#ebebf5", "#48484a", "#6e6e73")  # elevated card / soft white
-_BTN_SAVE   = ("#1a7a3c", "#d1fae5", "#166534", "#5ca87a")  # deep green / mint text
+# Button palette: (active_bg, active_fg, hover_bg, disabled_fg, disabled_bg)
+_BTN_REMOVE_BG = ("#0891b2", "#ecfeff", "#0e7490", "#67e8f9", "#0c2a32")
+_BTN_KEEP      = ("#d97706", "#fffbeb", "#b45309", "#fcd34d", "#3a2607")
+_BTN_DELETE    = ("#e11d48", "#fff1f2", "#be123c", "#fb7185", "#3f1519")
+_BTN_UNDO      = ("#8b5cf6", "#f5f3ff", "#7c3aed", "#c4b5fd", "#2a1f3d")
+_BTN_SAVE      = ("#10b981", "#ecfdf5", "#059669", "#6ee7b7", "#0f2a22")
+
+_KEEP_L_IDLE    = "📐   Keep region"
+_KEEP_L_CANCEL  = "✕   Cancel"
+_KEEP_L_CONFIRM = "✓   Confirm crop"
+
+# rembg ONNX sessions — try best quality first (see rembg README “Models”).
+_REMBG_MODEL_CANDIDATES: tuple[str, ...] = (
+    "birefnet-general",
+    "birefnet-general-lite",
+    "isnet-general-use",
+    "u2net",
+)
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -121,6 +136,44 @@ def _infer_save_params(img: Image.Image) -> dict:
     return {"format": "PNG", "compress_level": 1}
 
 
+def _flatten_rgba_on_color(img: Image.Image, rgb: tuple[int, int, int]) -> Image.Image:
+    """Composite RGBA onto a solid RGB background (for display or ML input)."""
+    if img.mode != "RGBA":
+        return img.convert("RGB")
+    bg = Image.new("RGB", img.size, rgb)
+    bg.paste(img, mask=img.split()[3])
+    return bg
+
+
+def _merge_lama_into_rgba(
+    orig_rgba: Image.Image, lama_rgb: Image.Image, dilated_mask_uint8: np.ndarray
+) -> Image.Image:
+    """Replace pixels under dilated inpaint mask with LaMa output; keep alpha elsewhere."""
+    o = np.array(orig_rgba.convert("RGBA"), copy=True)
+    r = np.array(lama_rgb.convert("RGB"))
+    mk = dilated_mask_uint8 > 127
+    o[mk, 0:3] = r[mk]
+    o[mk, 3] = 255
+    return Image.fromarray(o)
+
+
+def _smooth_alpha_channel(rgba: Image.Image, sigma: float = 0.9) -> Image.Image:
+    """Light Gaussian blur on alpha only — softer edges without touching RGB."""
+    if rgba.mode != "RGBA":
+        return rgba.convert("RGBA")
+    r, g, b, a = rgba.split()
+    a_np = np.array(a, dtype=np.float32)
+    a_np = cv2.GaussianBlur(a_np, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    a_out = np.clip(np.round(a_np), 0, 255).astype(np.uint8)
+    return Image.merge("RGBA", (r, g, b, Image.fromarray(a_out)))
+
+
+def _make_fully_opaque_rgba(patch: Image.Image) -> Image.Image:
+    """Tight crop as a rectangular sticker: RGB from original (transparent→white), alpha=255."""
+    rgb = _flatten_rgba_on_color(patch, (255, 255, 255))
+    return Image.merge("RGBA", (*rgb.split(), Image.new("L", rgb.size, 255)))
+
+
 # ── Main Application ──────────────────────────────────────────────────────────
 
 class ObjectRemoverApp:
@@ -161,6 +214,16 @@ class ObjectRemoverApp:
         self.lama       = None    # SimpleLama
         self.models_ready   = False
         self.sam_image_set  = False   # whether set_image() called for current work_image
+        self._op_busy       = False   # async inpaint / segment / rembg
+        self._rembg_lock    = threading.Lock()
+        self._rembg_session = None    # lazy; shared by Remove BG + Keep region
+        self._rembg_model_name: str | None = None
+
+        # ── Edit mode: "delete" = remove highlighted object; "keep" = crop to drag box
+        self.edit_mode: str = "delete"
+        self.keep_confirm_pending = False
+        self.pending_crop_rect: tuple[int, int, int, int] | None = None
+        self._keep_tight_global: tuple[int, int, int, int] | None = None  # gx0,gy0,gx1,gy1
 
         self._build_ui()
         self._load_models_async()
@@ -178,14 +241,18 @@ class ObjectRemoverApp:
         topbar.pack(fill=tk.X)
         topbar.pack_propagate(False)
 
-        _btn_topbar = lambda text, cmd, bg, hover: tk.Button(
-            topbar, text=text, command=cmd,
-            bg=bg, fg="#e8f0ff", font=("Helvetica", 12, "bold"),
-            relief=tk.FLAT, padx=16, pady=6, cursor="hand2",
-            activebackground=hover, activeforeground="#e8f0ff", bd=0,
-        )
-        _btn_topbar("  Add Image", self._open_dialog, "#0060cc", "#004fa8").pack(
-            side=tk.LEFT, padx=12, pady=10)
+        def _btn_topbar(text, cmd, bg, hover, fg="#e0f2fe"):
+            return tk.Button(
+                topbar, text=text, command=cmd,
+                bg=bg, fg=fg, font=("Helvetica", 12, "bold"),
+                relief=tk.FLAT, padx=16, pady=6, cursor="hand2",
+                activebackground=hover, activeforeground=fg, bd=0,
+            )
+
+        _btn_topbar(
+            "  Add Image", self._open_dialog,
+            "#2563eb", "#1d4ed8", fg="#dbeafe",
+        ).pack(side=tk.LEFT, padx=12, pady=10)
 
         self.status_var = tk.StringVar(value="Drag an image here or click  Add Image  to start")
         tk.Label(topbar, textvariable=self.status_var,
@@ -213,11 +280,12 @@ class ObjectRemoverApp:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
         if _DND_AVAILABLE:
-            # Register on root for maximum macOS compatibility (canvas alone is unreliable)
+            # Root + canvas both accept drops; inner widget (canvas) must bind <<Drop>>
+            # or file drops on the main area are lost.
             self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind("<<Drop>>",      self._on_file_drop)
-            # Canvas-level visual feedback only
+            self.root.dnd_bind("<<Drop>>", self._on_file_drop)
             self.canvas.drop_target_register(DND_FILES)
+            self.canvas.dnd_bind("<<Drop>>", self._on_file_drop)
             self.canvas.dnd_bind("<<DragEnter>>", self._on_drag_enter_canvas)
             self.canvas.dnd_bind("<<DragLeave>>", self._on_drag_leave_canvas)
 
@@ -233,10 +301,10 @@ class ObjectRemoverApp:
                  font=("Helvetica", 11, "bold")).pack(anchor=tk.W)
         for step in (
             "① Drag image here  or  Add Image",
-            "② Drag to select an object",
-            "③ AI highlights the object",
-            "④ Click  Delete Object",
-            "⑤ Repeat or Save the result",
+            "② Remove BG → transparent PNG",
+            "③ Keep region → AI finds subject, tight crop",
+            "④ Or drag to select + Delete Object",
+            "⑤ Undo / Save when done",
         ):
             tk.Label(card, text=step, bg=BG_CARD, fg=TEXT_DIM,
                      font=("Helvetica", 10), wraplength=185, justify=tk.LEFT,
@@ -245,19 +313,25 @@ class ObjectRemoverApp:
         tk.Frame(panel, bg=BG_CARD, height=1).pack(fill=tk.X, padx=10, pady=8)
 
         def _action_btn(text, cmd, palette):
-            bg, fg, hover_bg, _ = palette
+            bg, fg, hover_bg, dis_fg, dis_bg = palette
             b = tk.Button(
                 panel, text=text, command=cmd,
-                bg=BG_CARD, fg="#5a5a5e", font=("Helvetica", 12, "bold"),
+                bg=dis_bg, fg=dis_fg, font=("Helvetica", 12, "bold"),
                 relief=tk.FLAT, padx=12, pady=11, cursor="hand2",
                 activebackground=hover_bg, activeforeground=fg,
-                disabledforeground="#5a5a5e", bd=0, state=tk.DISABLED,
+                disabledforeground=dis_fg, bd=0, state=tk.DISABLED,
             )
             b.pack(fill=tk.X, padx=10, pady=3)
             b._active_bg = bg
             b._active_fg = fg
+            b._disabled_bg = dis_bg
+            b._disabled_fg = dis_fg
             return b
 
+        self.remove_bg_btn = _action_btn(
+            "🎭   Remove background", self._remove_background, _BTN_REMOVE_BG
+        )
+        self.keep_btn = _action_btn(_KEEP_L_IDLE, self._on_keep_click, _BTN_KEEP)
         self.delete_btn = _action_btn("🗑   Delete Object", self._delete_object, _BTN_DELETE)
         self.undo_btn   = _action_btn("↩   Undo",           self._undo,           _BTN_UNDO)
         self.save_btn   = _action_btn("💾   Save Image",     self._save_image,     _BTN_SAVE)
@@ -368,13 +442,33 @@ class ObjectRemoverApp:
 
     _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
-    def _on_file_drop(self, event):
-        """Handle a file dropped onto the canvas."""
-        self._on_drag_leave_canvas(event)
+    def _parse_drop_paths(self, data: str) -> list[str]:
+        """Normalize paths from tkinterdnd2 (macOS file://, Tcl braces, spaces)."""
+        if not data:
+            return []
         try:
-            paths = self.root.tk.splitlist(event.data)
-        except Exception:
-            paths = [event.data.strip("{}")]
+            raw_list = self.root.tk.splitlist(data)
+        except tk.TclError:
+            raw_list = [data]
+        out: list[str] = []
+        for raw in raw_list:
+            p = (raw or "").strip()
+            if not p:
+                continue
+            if len(p) >= 2 and p[0] == "{" and p[-1] == "}":
+                p = p[1:-1]
+            if p.startswith("file:"):
+                from urllib.parse import unquote, urlparse
+
+                parsed = urlparse(p)
+                p = unquote(parsed.path or "")
+            out.append(p)
+        return out
+
+    def _on_file_drop(self, event):
+        """Handle a file dropped onto the window or canvas."""
+        self._on_drag_leave_canvas(event)
+        paths = self._parse_drop_paths(getattr(event, "data", "") or "")
         if not paths:
             return
         path = paths[0]
@@ -411,7 +505,14 @@ class ObjectRemoverApp:
             self.mask_array = None
             self.has_highlight = False
             self.sam_image_set = False
+            self.edit_mode = "delete"
+            self.keep_confirm_pending = False
+            self.pending_crop_rect = None
+            self._keep_tight_global = None
+            self.keep_btn.configure(text=_KEEP_L_IDLE)
 
+            self._set_btn(self.remove_bg_btn, True)
+            self._set_btn(self.keep_btn, True)
             self._set_btn(self.delete_btn, False)
             self._set_btn(self.undo_btn, False)
             self._set_btn(self.save_btn, False)
@@ -447,7 +548,8 @@ class ObjectRemoverApp:
         self.off_x = (cw - dw) // 2
         self.off_y = (ch - dh) // 2
 
-        disp = self.work_image.resize((dw, dh), Image.LANCZOS)
+        flat = _flatten_rgba_on_color(self.work_image, (17, 17, 17))
+        disp = flat.resize((dw, dh), Image.LANCZOS)
 
         if mask is not None and mask.any():
             disp = self._blend_mask(disp, mask)
@@ -501,6 +603,12 @@ class ObjectRemoverApp:
         if self.has_highlight:
             self.mask_array   = None
             self.has_highlight = False
+            if self.edit_mode == "keep":
+                self.keep_confirm_pending = False
+                self.pending_crop_rect = None
+                self._keep_tight_global = None
+                self.keep_btn.configure(text=_KEEP_L_CANCEL)
+                self._set_btn(self.keep_btn, True)
             self._render()
             self._set_btn(self.delete_btn, False)
 
@@ -528,6 +636,11 @@ class ObjectRemoverApp:
         ox0, oy0 = self._c2o(min(x0, x1), min(y0, y1))
         ox1, oy1 = self._c2o(max(x0, x1), max(y0, y1))
 
+        if self.edit_mode == "keep":
+            self.pending_crop_rect = (ox0, oy0, ox1, oy1)
+            self._keep_detect_async(ox0, oy0, ox1, oy1)
+            return
+
         if not self.models_ready:
             messagebox.showinfo("Please wait", "AI models are still loading.\nTry again in a moment.")
             return
@@ -537,13 +650,16 @@ class ObjectRemoverApp:
     # ── Segmentation ───────────────────────────────────────────────────────────
 
     def _segment_async(self, box: np.ndarray):
+        self._op_busy = True
         self._set_status("Detecting object…")
         self.progress.start(10)
         self._set_btn(self.delete_btn, False)
+        self._set_btn(self.keep_btn, False)
+        self._set_btn(self.remove_bg_btn, False)
 
         def _worker():
             try:
-                img_rgb = np.array(self.work_image)   # uint8 RGB
+                img_rgb = np.array(_flatten_rgba_on_color(self.work_image, (255, 255, 255)))
                 if not self.sam_image_set:
                     self.predictor.set_image(img_rgb)
                     self.sam_image_set = True
@@ -559,21 +675,309 @@ class ObjectRemoverApp:
 
     def _on_segment_done(self, mask: np.ndarray):
         self.progress.stop()
+        self._op_busy = False
+        self._set_btn(self.remove_bg_btn, self.work_image is not None)
+
         if not mask.any():
             self._set_status("No object detected in selection — try drawing a wider box")
+            self._set_btn(self.keep_btn, True)
             return
         self.mask_array   = mask
         self.has_highlight = True
         self._render(mask=mask)
         self._set_btn(self.delete_btn, True)
+        self._set_btn(self.keep_btn, True)
         if self.sel_rect_id:
             self.canvas.delete(self.sel_rect_id)
         self._set_status("Object detected — click  Delete Object  to remove it")
 
     def _on_segment_err(self, msg: str):
         self.progress.stop()
+        self._op_busy = False
+        self._set_btn(self.remove_bg_btn, self.work_image is not None)
+        self._set_btn(self.keep_btn, self.work_image is not None)
         self._set_status(f"Segmentation error: {msg}")
         print("Segmentation error:", msg)
+
+    # ── rembg session (shared: Remove BG + Keep region) ─────────────────────────
+
+    def _ensure_rembg_session(self):
+        with self._rembg_lock:
+            if self._rembg_session is not None:
+                return self._rembg_session
+            from rembg import new_session
+
+            last_err: Exception | None = None
+            for name in _REMBG_MODEL_CANDIDATES:
+                try:
+                    self._rembg_session = new_session(name)
+                    self._rembg_model_name = name
+                    return self._rembg_session
+                except Exception as e:
+                    last_err = e
+            raise RuntimeError(
+                f"Could not load any rembg model (tried {list(_REMBG_MODEL_CANDIDATES)}): {last_err}"
+            )
+
+    # ── Keep region: rembg inside user box → tight crop (opaque sticker) ────────
+
+    def _keep_detect_async(self, ox0: int, oy0: int, ox1: int, oy1: int) -> None:
+        if self.work_image is None:
+            return
+        self._op_busy = True
+        self._set_status("Detecting subject (same model as Remove background)…")
+        self.progress.start(10)
+        self._set_btn(self.delete_btn, False)
+        self._set_btn(self.keep_btn, False)
+        self._set_btn(self.remove_bg_btn, False)
+
+        w, h = self.work_image.size
+        left = max(0, min(ox0, ox1))
+        top = max(0, min(oy0, oy1))
+        right = min(w, max(ox0, ox1))
+        bottom = min(h, max(oy0, oy1))
+        if right - left < 8 or bottom - top < 8:
+            self.progress.stop()
+            self._op_busy = False
+            self._set_btn(self.remove_bg_btn, True)
+            self._set_btn(self.keep_btn, True)
+            messagebox.showwarning("Selection too small", "Draw a larger box around the subject.")
+            return
+
+        region = self.work_image.crop((left, top, right, bottom))
+
+        def _worker():
+            try:
+                from rembg import remove
+            except ImportError:
+                self.root.after(
+                    0,
+                    lambda: self._on_keep_detect_err(
+                        "rembg is not installed. Run: pip install rembg onnxruntime"
+                    ),
+                )
+                return
+            try:
+                sess = self._ensure_rembg_session()
+                rb = remove(region, session=sess).convert("RGBA")
+                alpha = np.array(rb.split()[3], dtype=np.uint8)
+                ys, xs = np.where(alpha > 12)
+                if len(xs) == 0:
+                    self.root.after(0, self._on_keep_detect_done_empty)
+                    return
+
+                pad = 8
+                rx0 = max(0, int(xs.min()) - pad)
+                ry0 = max(0, int(ys.min()) - pad)
+                rx1 = min(region.width, int(xs.max()) + 1 + pad)
+                ry1 = min(region.height, int(ys.max()) + 1 + pad)
+                if rx1 - rx0 < 2 or ry1 - ry0 < 2:
+                    self.root.after(0, self._on_keep_detect_done_empty)
+                    return
+
+                gx0, gy0 = left + rx0, top + ry0
+                gx1, gy1 = left + rx1, top + ry1
+
+                mask_full = np.zeros((h, w), dtype=bool)
+                fg = alpha > 12
+                mask_full[top:bottom, left:right] = fg
+
+                tight = (gx0, gy0, gx1, gy1)
+                self.root.after(
+                    0,
+                    lambda: self._on_keep_detect_done(mask_full.copy(), tight),
+                )
+            except Exception as e:
+                self.root.after(0, lambda: self._on_keep_detect_err(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_keep_detect_done(self, mask_full: np.ndarray, tight: tuple[int, int, int, int]) -> None:
+        self.progress.stop()
+        self._op_busy = False
+        self._set_btn(self.remove_bg_btn, True)
+        self.mask_array = mask_full
+        self.has_highlight = True
+        self._keep_tight_global = tight
+        self._render(mask=mask_full)
+        self.keep_confirm_pending = True
+        self.keep_btn.configure(text=_KEEP_L_CONFIRM)
+        self._set_btn(self.keep_btn, True)
+        self._set_btn(self.delete_btn, False)
+        if self.sel_rect_id:
+            self.canvas.delete(self.sel_rect_id)
+        gx0, gy0, gx1, gy1 = tight
+        self._set_status(
+            f"Tight crop {gx1 - gx0} × {gy1 - gy0}px — original pixels inside; "
+            f"outside the file is transparent when layered. Click  Confirm crop."
+        )
+
+    def _on_keep_detect_done_empty(self) -> None:
+        self.progress.stop()
+        self._op_busy = False
+        self._set_btn(self.remove_bg_btn, True)
+        self._set_btn(self.keep_btn, True)
+        self.mask_array = None
+        self.has_highlight = False
+        self._keep_tight_global = None
+        self.keep_confirm_pending = False
+        self._render()
+        self._set_status(
+            "No subject found in that box — try a larger area or different framing."
+        )
+
+    def _on_keep_detect_err(self, msg: str) -> None:
+        self.progress.stop()
+        self._op_busy = False
+        self._set_btn(self.remove_bg_btn, self.work_image is not None)
+        self._set_btn(self.keep_btn, self.work_image is not None)
+        self._keep_tight_global = None
+        self.keep_confirm_pending = False
+        self.mask_array = None
+        self.has_highlight = False
+        self._render()
+        self._set_status(f"Keep-region error: {msg}")
+        print("Keep-region error:", msg)
+        messagebox.showerror("Keep region failed", msg)
+
+    # ── Keep-region crop ────────────────────────────────────────────────────────
+
+    def _reset_keep_flow_after_image_change(self) -> None:
+        self.edit_mode = "delete"
+        self.keep_confirm_pending = False
+        self.pending_crop_rect = None
+        self._keep_tight_global = None
+        self.keep_btn.configure(text=_KEEP_L_IDLE)
+
+    def _on_keep_click(self) -> None:
+        if self.work_image is None or self._op_busy:
+            return
+        if self.keep_confirm_pending:
+            self._confirm_keep_crop()
+            return
+        if self.edit_mode == "keep":
+            self._cancel_keep_mode()
+            return
+        self.edit_mode = "keep"
+        self.keep_confirm_pending = False
+        self.pending_crop_rect = None
+        if self.has_highlight:
+            self.mask_array = None
+            self.has_highlight = False
+            self._render()
+        self.keep_btn.configure(text=_KEEP_L_CANCEL)
+        self._set_btn(self.keep_btn, True)
+        self._set_btn(self.delete_btn, False)
+        self._set_status(
+            "Keep mode: drag around the subject — same AI as Remove background finds it, "
+            "then crops tight. Inside the crop, colors stay original (opaque sticker).  ✕ Cancel."
+        )
+
+    def _cancel_keep_mode(self) -> None:
+        self.edit_mode = "delete"
+        self.keep_confirm_pending = False
+        self.pending_crop_rect = None
+        self._keep_tight_global = None
+        self.mask_array = None
+        self.has_highlight = False
+        self.keep_btn.configure(text=_KEEP_L_IDLE)
+        self._render()
+        self._set_btn(self.keep_btn, True)
+        self._set_btn(self.delete_btn, False)
+        self._set_status("Keep mode cancelled.")
+
+    def _confirm_keep_crop(self) -> None:
+        if self.work_image is None or self._keep_tight_global is None:
+            messagebox.showwarning(
+                "Nothing to crop",
+                "Drag a box on the image first so the subject can be detected.",
+            )
+            return
+        gx0, gy0, gx1, gy1 = self._keep_tight_global
+        if gx1 - gx0 < 2 or gy1 - gy0 < 2:
+            messagebox.showwarning("Crop too small", "Try drawing a larger box.")
+            return
+        self.history.append(self.work_image.copy())
+        patch = self.work_image.crop((gx0, gy0, gx1, gy1))
+        self.work_image = _make_fully_opaque_rgba(patch)
+        self.mask_array = None
+        self.has_highlight = False
+        self.sam_image_set = False
+        self.orig_save_params = {"format": "PNG", "compress_level": 1}
+        self._reset_keep_flow_after_image_change()
+        self._render()
+        self._set_btn(self.delete_btn, False)
+        self._set_btn(self.keep_btn, True)
+        self._set_btn(self.remove_bg_btn, True)
+        self._set_btn(self.undo_btn, True)
+        self._set_btn(self.save_btn, True)
+        self._set_status(
+            f"Tight crop {gx1 - gx0} × {gy1 - gy0}px — opaque patch; layer over transparent bg."
+        )
+
+    # ── Remove background (RGBA) ───────────────────────────────────────────────
+
+    def _remove_background(self) -> None:
+        if self.work_image is None or self._op_busy:
+            return
+        self._op_busy = True
+        self._set_status("Removing background (first run may download model weights)…")
+        self.progress.start(10)
+        self._set_btn(self.remove_bg_btn, False)
+        self._set_btn(self.delete_btn, False)
+        self._set_btn(self.keep_btn, False)
+
+        snap = self.work_image.copy()
+
+        def _worker():
+            try:
+                from rembg import remove
+            except ImportError:
+                self.root.after(
+                    0,
+                    lambda: self._on_rembg_err(
+                        "rembg is not installed. Run: pip install rembg onnxruntime"
+                    ),
+                )
+                return
+            try:
+                sess = self._ensure_rembg_session()
+                out = remove(snap, session=sess).convert("RGBA")
+                out = _smooth_alpha_channel(out, sigma=0.9)
+                self.root.after(0, lambda: self._on_rembg_done(snap, out))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_rembg_err(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_rembg_done(self, snapshot: Image.Image, result: Image.Image) -> None:
+        self.progress.stop()
+        self._op_busy = False
+        self.history.append(snapshot)
+        self.work_image = result
+        self.mask_array = None
+        self.has_highlight = False
+        self.sam_image_set = False
+        self.orig_save_params = {"format": "PNG", "compress_level": 1}
+        self._reset_keep_flow_after_image_change()
+        self._render()
+        self._set_btn(self.remove_bg_btn, True)
+        self._set_btn(self.keep_btn, True)
+        self._set_btn(self.delete_btn, False)
+        self._set_btn(self.undo_btn, True)
+        self._set_btn(self.save_btn, True)
+        m = self._rembg_model_name or "rembg"
+        self._set_status(f"Background removed ({m}) — transparent PNG. Save as PNG to keep alpha.")
+
+    def _on_rembg_err(self, msg: str) -> None:
+        self.progress.stop()
+        self._op_busy = False
+        self._set_btn(self.remove_bg_btn, self.work_image is not None)
+        self._set_btn(self.keep_btn, self.work_image is not None)
+        self._set_btn(self.delete_btn, self.has_highlight)
+        self._set_status(f"Remove background error: {msg}")
+        print("Remove background error:", msg)
+        messagebox.showerror("Remove background failed", msg)
 
     # ── Delete / Inpaint ───────────────────────────────────────────────────────
 
@@ -581,21 +985,30 @@ class ObjectRemoverApp:
         if self.mask_array is None or self.work_image is None:
             return
 
+        self._op_busy = True
         self._set_status("Removing object with AI inpainting…")
         self.progress.start(10)
         self._set_btn(self.delete_btn, False)
+        self._set_btn(self.keep_btn, False)
+        self._set_btn(self.remove_bg_btn, False)
+
+        snap = self.work_image.copy()
 
         def _worker():
             try:
-                self.history.append(self.work_image.copy())
+                self.history.append(snap)
 
                 # Dilate mask slightly for cleaner fill edges
                 raw_mask = (self.mask_array * 255).astype(np.uint8)
                 dilated  = _dilate_mask(raw_mask, px=10)
                 mask_pil = Image.fromarray(dilated).convert("L")
 
-                result = self.lama(self.work_image, mask_pil)
-                result = result.convert("RGB")
+                rgb_in = _flatten_rgba_on_color(snap, (255, 255, 255))
+                result_rgb = self.lama(rgb_in, mask_pil).convert("RGB")
+                if snap.mode == "RGBA":
+                    result = _merge_lama_into_rgba(snap, result_rgb, dilated)
+                else:
+                    result = result_rgb
                 self.root.after(0, lambda: self._on_inpaint_done(result))
             except Exception as e:
                 self.root.after(0, lambda: self._on_inpaint_err(str(e)))
@@ -604,18 +1017,26 @@ class ObjectRemoverApp:
 
     def _on_inpaint_done(self, result: Image.Image):
         self.progress.stop()
+        self._op_busy = False
         self.work_image    = result
         self.mask_array    = None
         self.has_highlight = False
         self.sam_image_set = False   # next drag must re-encode the new image
+        self._reset_keep_flow_after_image_change()
         self._render()
         self._set_btn(self.delete_btn, False)
+        self._set_btn(self.remove_bg_btn, True)
+        self._set_btn(self.keep_btn, True)
         self._set_btn(self.undo_btn,   True)
         self._set_btn(self.save_btn,   True)
         self._set_status("Object removed!  Drag to select another, or save the result.")
 
     def _on_inpaint_err(self, msg: str):
         self.progress.stop()
+        self._op_busy = False
+        self._set_btn(self.remove_bg_btn, self.work_image is not None)
+        self._set_btn(self.keep_btn, self.work_image is not None)
+        self._set_btn(self.delete_btn, self.has_highlight)
         self._set_status(f"Inpainting error: {msg}")
         print("Inpainting error:", msg)
         messagebox.showerror("Inpainting Failed", f"Could not remove object:\n{msg}")
@@ -629,8 +1050,11 @@ class ObjectRemoverApp:
         self.mask_array    = None
         self.has_highlight = False
         self.sam_image_set = False
+        self._reset_keep_flow_after_image_change()
         self._render()
         self._set_btn(self.delete_btn, False)
+        self._set_btn(self.remove_bg_btn, True)
+        self._set_btn(self.keep_btn, True)
         self._set_btn(self.undo_btn, bool(self.history))
         self._set_btn(self.save_btn, True)
         self._set_status("Undone.")
@@ -641,7 +1065,13 @@ class ObjectRemoverApp:
         if self.work_image is None:
             return
 
-        fmt = self.orig_save_params.get("format", "PNG").upper()
+        if self.work_image.mode == "RGBA":
+            save_params: dict = {"format": "PNG", "compress_level": 1}
+            fmt = "PNG"
+        else:
+            save_params = dict(self.orig_save_params)
+            fmt = save_params.get("format", "PNG").upper()
+
         ext_map = {
             "JPEG": (".jpg",  [("JPEG image", "*.jpg *.jpeg"), ("All files", "*.*")]),
             "PNG":  (".png",  [("PNG image",  "*.png"),        ("All files", "*.*")]),
@@ -661,7 +1091,7 @@ class ObjectRemoverApp:
             return
 
         try:
-            self.work_image.save(out_path, **self.orig_save_params)
+            self.work_image.save(out_path, **save_params)
             self._set_status(f"Saved: {os.path.basename(out_path)}")
             messagebox.showinfo("Saved", f"Image saved:\n{out_path}")
         except Exception as e:
@@ -675,13 +1105,13 @@ class ObjectRemoverApp:
                 state=tk.NORMAL,
                 bg=btn._active_bg,
                 fg=btn._active_fg,
-                disabledforeground="#5a5a5e",
+                disabledforeground=getattr(btn, "_disabled_fg", "#8e8e93"),
             )
         else:
             btn.configure(
                 state=tk.DISABLED,
-                bg=BG_CARD,
-                fg="#5a5a5e",
+                bg=getattr(btn, "_disabled_bg", BG_CARD),
+                fg=getattr(btn, "_disabled_fg", "#5a5a5e"),
             )
 
     def _set_status(self, msg: str):
